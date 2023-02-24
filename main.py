@@ -7,14 +7,31 @@ import openai
 import os
 import requests
 from flask_cors import CORS
-from _md5 import md5
-from google.cloud import storage
+#from _md5 import md5
+import hashlib
+#from google.cloud import storage
+from azure.storage.blob import BlobServiceClient, BlobClient, ContainerClient
+import config as cfg
+from openai.error import InvalidRequestError
+import backoff
 
 app = Flask(__name__)
 # db=redis.from_url(os.environ['REDISCLOUD_URL'])
 # db = redis.StrictRedis(host='localhost', port=6379, db=0)
-# os.environ['CLOUD_STORAGE_BUCKET'] = 'researchgpt.appspot.com'
-CLOUD_STORAGE_BUCKET = os.environ['CLOUD_STORAGE_BUCKET']
+
+# Set the connection string and container name
+connection_string = cfg.BLOB_CONNECTION_STRING
+container_name = cfg.CONTAINER_NAME
+
+openai.api_base = cfg.API_BASE
+openai.api_key = cfg.AZURE_OPENAI_KEY
+
+#only azure api need below two lines
+openai.api_type = cfg.API_TYPE
+openai.api_version = cfg.API_VERSION
+
+
+
 CORS(app)
 
 class Chatbot():
@@ -88,8 +105,9 @@ class Chatbot():
 
     def embeddings(self, df):
         print('Calculating embeddings')
-        openai.api_key = os.getenv('OPENAI_API_KEY')
-        embedding_model = "text-embedding-ada-002"
+        openai.api_key = cfg.AZURE_OPENAI_KEY
+        embedding_model = cfg.EMBEDDING_MODEL
+        print('book length: ', len(df.text))
         embeddings = df.text.apply([lambda x: get_embedding(x, engine=embedding_model)])
         df["embeddings"] = embeddings
         print('Done calculating embeddings')
@@ -98,7 +116,7 @@ class Chatbot():
     def search(self, df, query, n=3, pprint=True):
         query_embedding = get_embedding(
             query,
-            engine="text-embedding-ada-002"
+            engine=cfg.EMBEDDING_MODEL
         )
         df["similarity"] = df.embeddings.apply(lambda x: cosine_similarity(x, query_embedding))
         
@@ -116,30 +134,40 @@ class Chatbot():
     def create_prompt(self, df, user_input):
         result = self.search(df, user_input, n=3)
         print(result)
-        prompt = """You are a large language model whose expertise is reading and summarizing scientific papers. 
-        You are given a query and a series of text embeddings from a paper in order of their cosine similarity to the query.
+        prompt = """You are an expert in summarizing scientific papers. 
+        You are given a query and a series of text embeddings.
         You must take the given embeddings and return a very detailed summary of the paper that answers the query.
             
             Given the question: """+ user_input + """
             
             and the following embeddings as data: 
-            
+           
             1.""" + str(result.iloc[0]['text']) + """
             2.""" + str(result.iloc[1]['text']) + """
-            3.""" + str(result.iloc[2]['text']) + """
+            3.""" + str(result.iloc[2]['text']) 
 
-            Return a detailed answer based on the paper:"""
 
-        print('Done creating prompt')
+        print('Done creating prompt', len(prompt))
         return prompt
 
-    def gpt(self, prompt):
-        print('Sending request to GPT-3')
-        openai.api_key = os.getenv('OPENAI_API_KEY')
-        r = openai.Completion.create(model="text-davinci-003", prompt=prompt, temperature=0.4, max_tokens=1500)
+
+    @backoff.on_exception(backoff.expo, ValueError, max_tries=2)
+    def gpt(self, prompt):        
+        prompt=prompt[:1000]+""""
+        
+        Return a detailed answer based on the paper:"""
+        #openai.api_key = cfg.AZURE_OPENAI_KEY
+
+        print('Sending request to GPT-3: ', len(prompt))
+        r = openai.Completion.create(engine=cfg.COMPLETION_MODEL, prompt=prompt, temperature=0.0, max_tokens=1500)
         answer = r.choices[0]['text']
         print('Done sending request to GPT-3')
         response = {'answer': answer, 'sources': sources}
+        # except InvalidRequestError:
+        #     prompt=prompt[:1000]
+        #     print('promot reduced to: ', len(prompt))
+        #     raise ValueError
+
         return response
 
 @app.route("/", methods=["GET", "POST"])
@@ -155,33 +183,44 @@ def process_pdf():
     # print(request.data)
     file = request.data
 
-    key = md5(file).hexdigest()
+    key = hashlib.md5(file).hexdigest()
     print(key)
     # Create a Cloud Storage client.
-    gcs = storage.Client()
+    #gcs = storage.Client()
+    # Create a BlobServiceClient object
+    blob_service_client = BlobServiceClient.from_connection_string(connection_string)
     name = key+'.json'
 
     # Get the bucket that the file will be uploaded to.
-    bucket = gcs.get_bucket(CLOUD_STORAGE_BUCKET)
+    #bucket = gcs.get_bucket(CLOUD_STORAGE_BUCKET)
+    # Create a ContainerClient object
+    container_client = blob_service_client.get_container_client(container_name)
     # Check if the file already exists
-    if bucket.blob(name).exists():
+    #if bucket.blob(name).exists():
+    # Check if the blob already exists in the container
+    blob_client = container_client.get_blob_client(name)
+    if blob_client.exists():
         print("File already exists")
         print("Done processing pdf")
         return {"key": key}
 
-    pdf = PdfReader(BytesIO(file))
-    chatbot = Chatbot()
-    paper_text = chatbot.extract_text(pdf)
-    df = chatbot.create_df(paper_text)
-    df = chatbot.embeddings(df)
-    
-    # Create a new blob and upload the file's content.
-    blob = bucket.blob(name)
-    blob.upload_from_string(df.to_json(), content_type='application/json')
-    # if db.get(key) is None:
-    #     db.set(key, df.to_json())
-    print("Done processing pdf")
-    return {"key": key}
+    else:
+        pdf = PdfReader(BytesIO(file))
+        chatbot = Chatbot()
+        paper_text = chatbot.extract_text(pdf)
+        df = chatbot.create_df(paper_text)
+        df = chatbot.embeddings(df)
+        
+        # Create a new blob and upload the file's content.
+        #blob = bucket.blob(name)
+        #blob.upload_from_string(df.to_json(), content_type='application/json')
+
+        # Upload the data to the blob
+        blob_client.upload_blob (df.to_json(), overwrite=True)
+        # if db.get(key) is None:
+        #     db.set(key, df.to_json())
+        print("Done processing pdf")
+        return {"key": key}
 
 @app.route("/download_pdf", methods=['POST'])
 def download_pdf():
@@ -191,46 +230,50 @@ def download_pdf():
     chatbot = Chatbot()
     url = request.json['url']
     r = requests.get(str(url))    
+    file = r.content
     print("Downloading pdf")
     print(r.status_code)
     # print(r.content)
-    key = md5(r.content).hexdigest()
-
+    
+    key = hashlib.md5(file).hexdigest()
     # Create a Cloud Storage client.
-    gcs = storage.Client()
+    blob_service_client = BlobServiceClient.from_connection_string(connection_string)
     name = key+'.json'
-
+    container_client = blob_service_client.get_container_client(container_name)
     # Get the bucket that the file will be uploaded to.
-    bucket = gcs.get_bucket(CLOUD_STORAGE_BUCKET)
-    # Check if the file already exists
-    if bucket.blob(name).exists():
+    blob_client = container_client.get_blob_client(name)
+    if blob_client.exists():
         print("File already exists")
         print("Done processing pdf")
         return {"key": key}
+    else:
+        pdf = PdfReader(BytesIO(file))
+        paper_text = chatbot.extract_text(pdf)
+        df = chatbot.create_df(paper_text)
+        df = chatbot.embeddings(df)
 
-    pdf = PdfReader(BytesIO(r.content))
-    paper_text = chatbot.extract_text(pdf)
-    df = chatbot.create_df(paper_text)
-    df = chatbot.embeddings(df)
-
-    # Create a new blob and upload the file's content.
-    blob = bucket.blob(name)
-    blob.upload_from_string(df.to_json(), content_type='application/json')
-    print("Done processing pdf")
-    return {"key": key}
+        # Create a new blob and upload the file's content.
+        blob_client.upload_blob (df.to_json(), overwrite=True)
+        print("Done processing pdf")
+        return {"key": key}
 
 @app.route("/reply", methods=['POST'])
 def reply():
     chatbot = Chatbot()
-    key = request.json['key']
+    key = request.json['blob-key']
     query = request.json['query']
     query = str(query)
     print(query)
     # df = pd.read_json(BytesIO(db.get(key)))
-    gcs = storage.Client()
-    bucket = gcs.get_bucket(CLOUD_STORAGE_BUCKET)
-    blob = bucket.blob(key+'.json')
-    df = pd.read_json(BytesIO(blob.download_as_string()))
+    blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+    name = key+'.json'
+    container_client = blob_service_client.get_container_client(container_name)
+    # Get the bucket that the file will be uploaded to.
+    blob_client = container_client.get_blob_client(name)
+    # Download the data from the blob
+    data_json = blob_client.download_blob().content_as_text()
+    
+    df = pd.read_json(data_json, orient="records")
     print(df.head(5))
     prompt = chatbot.create_prompt(df, query)
     response = chatbot.gpt(prompt)

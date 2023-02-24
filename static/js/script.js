@@ -34,7 +34,7 @@ send.addEventListener("click", function(event) {
   // call the endpoint /reply with the message and get the reply.
   fetch('/reply', {
       method: 'POST',
-      body: JSON.stringify({'query': message, 'key': window.key}),
+      body: JSON.stringify({'query': message, 'blob-key': window.key}),
       headers: {
           'Content-Type': 'application/json'
       }
